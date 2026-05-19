@@ -16,6 +16,7 @@ You can use PEADM to deploy and manage PE installations for standard, large, and
     - [What PEADM does not affect](#what-peadm-does-not-affect)
     - [Requirements](#requirements)
   - [Usage](#usage)
+    - [Preflight checks](#preflight-checks)
   - [Reference](#reference)
   - [Getting help](#getting-help)
   - [License](#license)
@@ -82,6 +83,48 @@ For instructions on using PEADM plans, see the following PEADM docs:
 - [Upgrade](https://github.com/puppetlabs/puppetlabs-peadm/blob/main/documentation/upgrade.md)
 - [Convert](https://github.com/puppetlabs/puppetlabs-peadm/blob/main/documentation/convert.md)
 - [Status](https://github.com/puppetlabs/puppetlabs-peadm/blob/main/documentation/status.md)
+
+### Preflight checks
+
+Run `peadm::preflight` before `peadm::install` or `peadm::upgrade` to validate that your infrastructure meets all requirements. The plan performs the following checks:
+
+- Bolt version is supported
+- Architecture parameter combination is valid
+- Target PE version is supported (when `version` is provided)
+- RBAC token is valid against the primary (when compiler hosts are provided)
+- All nodes are reachable and return consistent OS platform information
+- Hostname/certname alignment (warns on mismatch rather than failing)
+- PE master rules are current (warns if `peadm::convert` needs to be run first)
+- pxp-agent can reach the primary on port 8142 (when compiler hosts are provided)
+
+```bash
+# Standard — before install
+bolt plan run peadm::preflight \
+  primary_host=primary.example.com \
+  version=2023.8.9
+
+# Extra Large with DR — before upgrade
+bolt plan run peadm::preflight \
+  primary_host=primary.example.com \
+  replica_host=replica.example.com \
+  compiler_hosts='["compiler1.example.com","compiler2.example.com"]' \
+  primary_postgresql_host=psql-a.example.com \
+  replica_postgresql_host=psql-b.example.com \
+  version=2023.8.9
+```
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `primary_host` | `Peadm::SingleTargetSpec` | Yes | Hostname/certname of the primary Puppet server |
+| `replica_host` | `Peadm::SingleTargetSpec` | No | Hostname/certname of the replica server |
+| `compiler_hosts` | `TargetSpec` | No | Hostnames/certnames of compiler nodes |
+| `primary_postgresql_host` | `Peadm::SingleTargetSpec` | No | Primary PE-PostgreSQL host (XL only) |
+| `replica_postgresql_host` | `Peadm::SingleTargetSpec` | No | Replica PE-PostgreSQL host (XL only) |
+| `version` | `Peadm::Pe_version` | No | Target PE version to validate |
+| `token_file` | `String` | No | Path to a PE RBAC token file |
+| `pe_admin_password` | `String` | No | PE admin password; generates a short-lived token at runtime instead of requiring `token_file` |
+| `token_lifetime` | `String` | No | Lifetime for the generated token (default: `1h`) |
+| `permit_unsafe_versions` | `Boolean` | No | Suppress errors for unsupported PE versions (default: `false`) |
 
 ## Reference
 
