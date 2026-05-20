@@ -49,6 +49,7 @@ plan peadm::preflight (
   Optional[String[1]]               $pe_admin_password       = undef,  # lint:ignore:140chars Bolt cannot auto-wrap CLI strings as Sensitive
   String                            $token_lifetime          = '1h',
   Boolean                           $permit_unsafe_versions  = false,
+  Optional[String]                  $html_report_file        = undef,
 ) {
   peadm::log_plan_parameters({
     'primary_host'            => $primary_host,
@@ -157,12 +158,14 @@ plan peadm::preflight (
   # Key PE ports that all infrastructure nodes must reach on the primary:
   #   8140 - Puppet Server (catalog requests, file serving)
   #   8081 - PuppetDB
-  # PostgreSQL port 5432 is checked separately for XL only (primary → psql node)
+  # PostgreSQL port 5432: all PE server nodes must reach both psql nodes (XL only)
   out::message('# Checking firewall rules (PE ports on primary)')
   $primary_fqdn = $primary_target[0].peadm::certname()
 
   $firewall_infra_targets = peadm::flatten_compact([$replica_target, $compiler_targets])
   $fw_port_results = {}
+  $psql_targets      = peadm::flatten_compact([$primary_postgresql_target, $replica_postgresql_target])
+  $pe_server_targets = peadm::flatten_compact([$primary_target, $replica_target])
 
   $fw_8140_failures = [] + ($firewall_infra_targets.size > 0 ? {
     true => run_command(
@@ -182,14 +185,26 @@ plan peadm::preflight (
     default => [],
   })
 
-  $fw_5432_failures = [] + ($primary_postgresql_target.size > 0 ? {
+  # Check all PE server nodes (primary + replica) can reach both psql nodes on 5432
+  $fw_5432_failures_primary_psql = [] + ($primary_postgresql_target.size > 0 ? {
     true => run_command(
       "timeout 5 bash -c 'echo >/dev/tcp/${$primary_postgresql_target[0].peadm::certname()}/5432'",
-      $primary_target,
+      $pe_server_targets,
       '_catch_errors' => true,
     ).error_set.targets.map |$t| { "${$t.peadm::certname()} -> ${$primary_postgresql_target[0].peadm::certname()}:5432" },
     default => [],
   })
+
+  $fw_5432_failures_replica_psql = [] + ($replica_postgresql_target.size > 0 ? {
+    true => run_command(
+      "timeout 5 bash -c 'echo >/dev/tcp/${$replica_postgresql_target[0].peadm::certname()}/5432'",
+      $pe_server_targets,
+      '_catch_errors' => true,
+    ).error_set.targets.map |$t| { "${$t.peadm::certname()} -> ${$replica_postgresql_target[0].peadm::certname()}:5432" },
+    default => [],
+  })
+
+  $fw_5432_failures = $fw_5432_failures_primary_psql + $fw_5432_failures_replica_psql
 
   $all_fw_failures = $fw_8140_failures + $fw_8081_failures + $fw_5432_failures
   if $all_fw_failures.size > 0 {
@@ -291,7 +306,7 @@ plan peadm::preflight (
   out::message('# Checking PE service logs for recent errors')
 
   $log_warnings = run_command(
-    'for log in puppetserver/puppetserver puppetdb/puppetdb console-services/console-services orchestration-services/orchestration-services; do errs=$(tail -500 /var/log/puppetlabs/$log.log 2>/dev/null | grep "ERROR\|FATAL"); if [ -n "$errs" ]; then count=$(echo "$errs" | wc -l | tr -d " "); echo "$log: $count recent error(s)"; echo "$errs" | tail -3 | sed "s/^/  >> /"; fi; done; true',
+    'for log in puppetserver/puppetserver puppetdb/puppetdb console-services/console-services orchestration-services/orchestration-services; do logfile=/var/log/puppetlabs/$log.log; errs=$(tail -500 "$logfile" 2>/dev/null | grep -E "ERROR|FATAL"); [ -z "$errs" ] && continue; count=$(echo "$errs" | wc -l | tr -d " "); last_ts=$(echo "$errs" | tail -1 | grep -oE "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}" | head -1); if [ -n "$last_ts" ] && epoch=$(date -d "$last_ts" +%s 2>/dev/null) && [ -n "$epoch" ]; then delta=$(( $(date +%s) - epoch )); if [ $delta -lt 60 ]; then ago="${delta}s ago"; elif [ $delta -lt 3600 ]; then ago="$((delta/60))m ago"; elif [ $delta -lt 86400 ]; then ago="$((delta/3600))h ago"; else ago="$((delta/86400))d ago"; fi; else ago="time unknown"; fi; echo "$log: $count error(s), last seen $ago"; echo "$errs" | tail -5 | sed "s/^/  >> /"; done; true',
     $primary_target,
     '_catch_errors' => true,
   ).ok_set.results.filter |$r| {
@@ -308,7 +323,7 @@ plan peadm::preflight (
 
   $compiler_log_warnings = $compiler_targets.size > 0 ? {
     true => run_command(
-      'errs=$(tail -500 /var/log/puppetlabs/pxp-agent/pxp-agent.log 2>/dev/null | grep "ERROR\|FATAL"); if [ -n "$errs" ]; then count=$(echo "$errs" | wc -l | tr -d " "); echo "pxp-agent: $count recent error(s)"; echo "$errs" | tail -3 | sed "s/^/  >> /"; fi; true',
+      'errs=$(tail -500 /var/log/puppetlabs/pxp-agent/pxp-agent.log 2>/dev/null | grep -E "ERROR|FATAL"); [ -z "$errs" ] && exit 0; count=$(echo "$errs" | wc -l | tr -d " "); last_ts=$(echo "$errs" | tail -1 | grep -oE "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}" | head -1); if [ -n "$last_ts" ] && epoch=$(date -d "$last_ts" +%s 2>/dev/null) && [ -n "$epoch" ]; then delta=$(( $(date +%s) - epoch )); if [ $delta -lt 60 ]; then ago="${delta}s ago"; elif [ $delta -lt 3600 ]; then ago="$((delta/60))m ago"; elif [ $delta -lt 86400 ]; then ago="$((delta/3600))h ago"; else ago="$((delta/86400))d ago"; fi; else ago="time unknown"; fi; echo "pxp-agent: $count error(s), last seen $ago"; echo "$errs" | tail -5 | sed "s/^/  >> /"; true',
       $compiler_targets,
       '_catch_errors' => true,
     ).ok_set.results.filter |$r| {
@@ -325,10 +340,121 @@ plan peadm::preflight (
     default => [],
   }
 
-  $all_log_warnings = $log_warnings + $compiler_log_warnings
+  $psql_log_warnings = $psql_targets.size > 0 ? {
+    true => run_command(
+      'logdir=/var/log/puppetlabs/postgresql; logfile=$(ls -t "$logdir"/postgresql-*.log 2>/dev/null | head -1); [ -z "$logfile" ] && exit 0; errs=$(tail -500 "$logfile" 2>/dev/null | grep -E "ERROR|FATAL"); [ -z "$errs" ] && exit 0; count=$(echo "$errs" | wc -l | tr -d " "); last_ts=$(echo "$errs" | tail -1 | grep -oE "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}" | head -1); if [ -n "$last_ts" ] && epoch=$(date -d "$last_ts" +%s 2>/dev/null) && [ -n "$epoch" ]; then delta=$(( $(date +%s) - epoch )); if [ $delta -lt 60 ]; then ago="${delta}s ago"; elif [ $delta -lt 3600 ]; then ago="$((delta/60))m ago"; elif [ $delta -lt 86400 ]; then ago="$((delta/3600))h ago"; else ago="$((delta/86400))d ago"; fi; else ago="time unknown"; fi; echo "postgresql: $count error(s), last seen $ago"; echo "$errs" | tail -5 | sed "s/^/  >> /"; true',
+      $psql_targets,
+      '_catch_errors' => true,
+    ).ok_set.results.filter |$r| {
+      $r['stdout'].strip != ''
+    }.map |$r| {
+      $certname = $r.target.peadm::certname()
+      $r['stdout'].strip.split("\n").map |$l| {
+        $l =~ /^  >> / ? {
+          true    => $l,
+          default => "${certname}: ${$l}",
+        }
+      }
+    }.flatten,
+    default => [],
+  }
+
+  $all_log_warnings = $log_warnings + $compiler_log_warnings + $psql_log_warnings
 
   if $all_log_warnings.size > 0 {
-    out::message("WARNING: Recent ERROR/FATAL entries found in PE logs:\n  ${$all_log_warnings.join("\n  ")}")
+    out::message("WARNING: Recent ERROR/FATAL entries found in PE logs:\n${$all_log_warnings.join("\n")}")
+  }
+
+  # ── Database node performance checks ──────────────────────────────────────
+  # Validates disk write throughput and I/O wait on primary and replica psql
+  # nodes. Connectivity is covered by the port 5432 firewall checks above.
+  # All checks are warn-only — PE-PostgreSQL may not be installed yet.
+  out::message('# Checking database node disk performance')
+
+  # Disk write throughput — PE-PostgreSQL requires sustained sequential writes.
+  # Threshold: 100 MB/s. fdatasync ensures kernel buffer flushes are measured.
+  $db_throughput_min_mbs = 100
+  $db_throughput_raw = $psql_targets.size > 0 ? {
+    true => run_command(
+      @(CMD),
+        dd if=/dev/zero of=/tmp/peadm_preflight_dd bs=1M count=256 conv=fdatasync 2>&1 | awk '/copied/{for(i=1;i<=NF;i++) if($i~/MB\/s/){printf "%.0f",$(i-1); exit}}'
+      |-CMD
+      $psql_targets,
+      '_catch_errors' => true,
+    ).ok_set.results,
+    default => [],
+  }
+  if $psql_targets.size > 0 {
+    run_command('rm -f /tmp/peadm_preflight_dd', $psql_targets, '_catch_errors' => true)
+  }
+  $db_throughput_warnings = $db_throughput_raw.filter |$r| {
+    $raw = $r['stdout'].strip
+    $raw =~ /^\d+$/ and Integer($raw, 10) < $db_throughput_min_mbs
+  }.map |$r| {
+    "${$r.target.peadm::certname()}: disk write ${$r['stdout'].strip} MB/s (minimum ${db_throughput_min_mbs} MB/s)"
+  }
+
+  # I/O wait — sustained iowait > 20% indicates a storage bottleneck that will
+  # degrade PostgreSQL write latency. Sampled over a 1-second window.
+  $db_iowait_warn_pct = 20
+  $db_iowait_warnings = $psql_targets.size > 0 ? {
+    true => run_command(
+      @(CMD),
+        perl -e 'sub r{open F,"/proc/stat";my @v=(split" ",<F>)[1..8];close F;@v} my @a=r();sleep 1;my @b=r();my $dt=0;$dt+=$b[$_]-$a[$_] for 0..$#a;my $diow=$b[4]-$a[4];printf "%.1f\n",$dt>0?$diow*100/$dt:0'
+      |-CMD
+      $psql_targets,
+      '_catch_errors' => true,
+    ).ok_set.results.filter |$r| {
+      $raw = $r['stdout'].strip
+      $raw =~ /^\d+(\.\d+)?$/ and Float($raw) >= $db_iowait_warn_pct
+    }.map |$r| {
+      "${$r.target.peadm::certname()}: I/O wait ${$r['stdout'].strip}% (threshold ${db_iowait_warn_pct}%)"
+    },
+    default => [],
+  }
+
+  # pe-postgresql service state — warns if not active (may not be installed yet)
+  $db_svc_warnings = $psql_targets.size > 0 ? {
+    true => run_command(
+      'systemctl is-active pe-postgresql 2>/dev/null || echo inactive',
+      $psql_targets,
+      '_catch_errors' => true,
+    ).ok_set.results.filter |$r| {
+      $r['stdout'].strip != 'active'
+    }.map |$r| { "${$r.target.peadm::certname()}: pe-postgresql is ${$r['stdout'].strip} (may not be installed yet)" },
+    default => [],
+  }
+
+  # CPU load — warn if 1-minute load average > 4.0
+  $db_load_warnings = $psql_targets.size > 0 ? {
+    true => run_command(
+      "awk '{print \$1}' /proc/loadavg",
+      $psql_targets,
+      '_catch_errors' => true,
+    ).ok_set.results.filter |$r| {
+      $raw_load = $r['stdout'].strip
+      $raw_load =~ /^[0-9.]+$/ and Float($raw_load) > 4.0
+    }.map |$r| { "${$r.target.peadm::certname()}: load average ${$r['stdout'].strip} (threshold 4.0)" },
+    default => [],
+  }
+
+  # Replication streaming — verify replica psql is receiving WAL from primary.
+  # Skipped silently when pe-postgresql is not yet running (pre-install scenario).
+  $db_repl_warnings = ($primary_postgresql_target.size > 0 and $replica_postgresql_target.size > 0) ? {
+    true => run_command(
+      "psql -U pe-postgres -tAc \"SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn)::text, 'no_replica') FROM pg_stat_replication LIMIT 1;\" 2>/dev/null || echo not_running",
+      $primary_postgresql_target,
+      '_catch_errors' => true,
+    ).ok_set.results.filter |$r| {
+      $r['stdout'].strip == 'no_replica'
+    }.map |$r| { "${$r.target.peadm::certname()}: no replica currently streaming from primary PostgreSQL" },
+    default => [],
+  }
+
+  $db_warnings = $db_throughput_warnings + $db_iowait_warnings + $db_svc_warnings + $db_load_warnings + $db_repl_warnings
+
+  if $db_warnings.size > 0 {
+    out::message("WARNING: Database node performance checks flagged issues:\n  ${$db_warnings.join("\n  ")}")
   }
 
   $warning_count = $hostname_mismatches.size
@@ -337,6 +463,7 @@ plan peadm::preflight (
     + $mem_warnings.size
     + $all_svc_issues.size
     + $all_log_warnings.size
+    + $db_warnings.size
 
   # ── Summary ────────────────────────────────────────────────────────────────
   $pass = '✓'
@@ -394,14 +521,25 @@ plan peadm::preflight (
     default => "${pass}  Service health     : all services running",
   }
 
+  # Group log warning lines by host: header lines carry "certname: ..." prefix;
+  # "  >> ..." lines are raw log excerpts that belong to the preceding header.
+  $log_grouped_lines = $all_log_warnings.reduce({ 'current' => '', 'out' => [] }) |$acc, $l| {
+    if $l =~ /^  >> / {
+      { 'current' => $acc['current'], 'out' => $acc['out'] + ["              ${$l.strip}"] }
+    } else {
+      $parts = $l.split(': ')
+      $host  = $parts[0]
+      $entry = $parts[1,-1].join(': ')
+      $host != $acc['current'] ? {
+        true    => { 'current' => $host, 'out' => $acc['out'] + ["        ── ${host}", "           ⤷ ${entry}"] },
+        default => { 'current' => $host, 'out' => $acc['out'] + ["           ⤷ ${entry}"] },
+      }
+    }
+  }['out']
+
   $log_summary = $all_log_warnings.size > 0 ? {
     true    => "${warn}  Log errors         : ERROR/FATAL entries found in PE logs\n${
-      $all_log_warnings.map |$l| {
-        $l =~ /^  >> / ? {
-          true    => "              ${$l.strip}",
-          default => "           ⤷ ${l}",
-        }
-      }.join("\n")
+      $log_grouped_lines.join("\n")
     }",
     default => "${pass}  Log errors         : no recent ERROR/FATAL entries found",
   }
@@ -414,6 +552,16 @@ plan peadm::preflight (
   $version_summary = $version ? {
     undef   => "-   PE version         : not checked",
     default => "${pass}  PE version         : ${version} supported",
+  }
+
+  $db_summary = $psql_targets.size == 0 ? {
+    true    => "-   Database nodes     : skipped (no psql targets)",
+    default => $db_warnings.size > 0 ? {
+      true    => "${warn}  Database nodes     : ${$db_warnings.size} issue(s) detected\n${
+        $db_warnings.map |$d| { "           ⤷ ${d}" }.join("\n")
+      }",
+      default => "${pass}  Database nodes     : performance and connectivity checks passed",
+    },
   }
 
   out::message(@("SUMMARY"/$))
@@ -436,8 +584,192 @@ plan peadm::preflight (
      ${log_summary}
      ${rules_summary}
      ${version_summary}
+     ${db_summary}
     ================================================
     | SUMMARY
+
+  # ── HTML report ───────────────────────────────────────────────────────────
+  if $html_report_file {
+    $log_svc_count = $all_log_warnings.filter |$l| { $l !~ /^  >> / }.size
+
+    $html_check_rows = [
+      {
+        'label'   => 'RBAC Token',
+        'status'  => ($compiler_targets and $compiler_targets.size > 0) ? { true => 'pass', default => 'skip' },
+        'summary' => ($compiler_targets and $compiler_targets.size > 0) ? { true => 'Token validated', default => 'Skipped (no compilers)' },
+        'details' => [],
+      },
+      {
+        'label'   => 'Node Connectivity',
+        'status'  => 'pass',
+        'summary' => "${all_targets.size} target(s) reachable",
+        'details' => [],
+      },
+      {
+        'label'   => 'Hostname / Certname',
+        'status'  => $hostname_mismatches.size > 0 ? { true => 'warn', default => 'pass' },
+        'summary' => $hostname_mismatches.size > 0 ? {
+          true    => "${$hostname_mismatches.size} mismatch(es) detected",
+          default => 'All targets match',
+        },
+        'details' => $hostname_mismatches.map |$r| { "${$r.target.peadm::certname()} reports hostname '${$r['hostname']}'" },
+      },
+      {
+        'label'   => 'OS Platform',
+        'status'  => 'pass',
+        'summary' => "${platform} (homogeneous)",
+        'details' => [],
+      },
+      {
+        'label'   => 'PXP-Agent :8142',
+        'status'  => ($compiler_targets and $compiler_targets.size > 0) ? { true => 'pass', default => 'skip' },
+        'summary' => ($compiler_targets and $compiler_targets.size > 0) ? { true => 'All compilers can reach primary', default => 'Skipped (no compilers)' },
+        'details' => [],
+      },
+      {
+        'label'   => 'Firewall Rules',
+        'status'  => $all_fw_failures.size > 0 ? { true => 'fail', default => 'pass' },
+        'summary' => $all_fw_failures.size > 0 ? { true => "${$all_fw_failures.size} blocked connection(s)", default => 'All required ports open' },
+        'details' => $all_fw_failures,
+      },
+      {
+        'label'   => 'Disk Space',
+        'status'  => $disk_warnings.size > 0 ? { true => 'warn', default => 'pass' },
+        'summary' => $disk_warnings.size > 0 ? { true => "${$disk_warnings.size} node(s) below minimum", default => 'All nodes meet requirements' },
+        'details' => $disk_warnings,
+      },
+      {
+        'label'   => 'Memory',
+        'status'  => $mem_warnings.size > 0 ? { true => 'warn', default => 'pass' },
+        'summary' => $mem_warnings.size > 0 ? { true => "${$mem_warnings.size} node(s) below minimum", default => 'All nodes have sufficient memory' },
+        'details' => $mem_warnings,
+      },
+      {
+        'label'   => 'Service Health',
+        'status'  => $all_svc_issues.size > 0 ? { true => 'warn', default => 'pass' },
+        'summary' => $all_svc_issues.size > 0 ? { true => "${$all_svc_issues.size} issue(s) detected", default => 'All services running' },
+        'details' => $all_svc_issues,
+      },
+      {
+        'label'   => 'Log Errors',
+        'status'  => $all_log_warnings.size > 0 ? { true => 'warn', default => 'pass' },
+        'summary' => $all_log_warnings.size > 0 ? { true => "${log_svc_count} service log(s) with ERROR/FATAL entries", default => 'No recent ERROR/FATAL entries' },
+        'details' => $all_log_warnings,
+      },
+      {
+        'label'   => 'PE Master Rules',
+        'status'  => $rules_check['updated'] ? { true => 'pass', default => 'warn' },
+        'summary' => $rules_check['updated'] ? { true => 'Current', default => 'Not current — run peadm::convert before upgrading' },
+        'details' => [],
+      },
+      {
+        'label'   => 'PE Version',
+        'status'  => $version ? { undef => 'skip', default => 'pass' },
+        'summary' => $version ? { undef => 'Not checked', default => "${version} supported" },
+        'details' => [],
+      },
+      {
+        'label'   => 'Database Nodes',
+        'status'  => $psql_targets.size == 0 ? { true => 'skip', default => $db_warnings.size > 0 ? { true => 'warn', default => 'pass' } },
+        'summary' => $psql_targets.size == 0 ? {
+          true    => 'Skipped (no psql targets)',
+          default => $db_warnings.size > 0 ? { true => "${$db_warnings.size} issue(s) detected", default => 'All checks passed' },
+        },
+        'details' => $db_warnings,
+      },
+    ]
+
+    $tr_html = $html_check_rows.map |$row| {
+      $st   = $row['status']
+      $icon = $st ? { 'pass' => '&#10003;', 'warn' => '&#9888;', 'fail' => '&#10007;', default => '&ndash;' }
+      $detail_items = $row['details']
+      $detail_li = $detail_items.map |$d| {
+        $d =~ /^  >> / ? {
+          true    => "<li class=\"exc\">${$d.strip.regsubst('^>> ', '')}</li>",
+          default => "<li>${d}</li>",
+        }
+      }
+      $detail_html = $detail_items.size > 0 ? {
+        true    => "<ul>${$detail_li.join('')}</ul>",
+        default => '',
+      }
+      "<tr class=\"${st}\"><td class=\"ic\">${icon}</td><td class=\"lbl\">${$row['label']}</td><td class=\"det\">${$row['summary']}${detail_html}</td></tr>"
+    }.join("\n")
+
+    $overall_cls = $warning_count == 0 ? { true => 'pass', default => 'warn' }
+    $overall_msg = $warning_count == 0 ? {
+      true    => 'All checks passed &mdash; infrastructure is ready.',
+      default => "${warning_count} warning(s) detected &mdash; review before proceeding.",
+    }
+    $version_meta = $version ? { undef => '', default => " &bull; PE ${version}" }
+    $ts              = Timestamp.new()
+    $report_ts       = $ts.strftime('%Y-%m-%d %H:%M:%S UTC')
+    $report_ts_file  = $ts.strftime('%Y-%m-%d_%H-%M-%S')
+    $actual_report_file = $html_report_file =~ /\.html$/ ? {
+      true    => $html_report_file.regsubst('\.html$', "-${report_ts_file}.html"),
+      default => "${html_report_file}-${report_ts_file}",
+    }
+
+    $html_content = @("HTML")
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>PE Preflight Report</title>
+        <style>
+          *{box-sizing:border-box;margin:0;padding:0}
+          body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh;padding:24px}
+          .card{max-width:900px;margin:0 auto;background:#fff;border-radius:10px;box-shadow:0 2px 12px rgba(0,0,0,.1);overflow:hidden}
+          header{background:#1a1a2e;color:#fff;padding:24px 28px}
+          header h1{font-size:1.4rem;font-weight:600;margin-bottom:4px}
+          header p{font-size:.8rem;opacity:.6}
+          .banner{padding:12px 28px;font-weight:600;font-size:.9rem}
+          .banner.pass{background:#d4edda;color:#155724}
+          .banner.warn{background:#fff3cd;color:#7d6608}
+          .banner.fail{background:#f8d7da;color:#721c24}
+          .meta{padding:10px 28px;background:#f8f9fa;border-bottom:1px solid #e9ecef;font-size:.8rem;color:#555}
+          table{width:100%;border-collapse:collapse}
+          th{text-align:left;padding:9px 16px;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;background:#343a40;color:#ccc}
+          td{padding:9px 16px;border-bottom:1px solid #f0f0f0;font-size:.85rem;vertical-align:top}
+          tr.pass td{background:#f6fff8}
+          tr.warn td{background:#fffef0}
+          tr.fail td{background:#fff6f6}
+          tr.skip td{background:#fafafa;color:#999}
+          td.ic{width:28px;font-size:1rem;font-weight:700;text-align:center}
+          tr.pass .ic{color:#28a745}
+          tr.warn .ic{color:#856404}
+          tr.fail .ic{color:#dc3545}
+          tr.skip .ic{color:#aaa}
+          td.lbl{white-space:nowrap;font-weight:600;width:170px}
+          td.det ul{margin-top:5px;padding-left:16px}
+          td.det li{color:#666;margin:2px 0}
+          li.exc{font-family:'SFMono-Regular',Consolas,monospace;font-size:.78rem;color:#444;background:#f5f5f5;border-radius:3px;padding:2px 5px;word-break:break-word;list-style:none;border-left:2px solid #ccc;margin-left:-16px;padding-left:14px}
+          footer{padding:12px 28px;text-align:right;font-size:.75rem;color:#aaa;border-top:1px solid #f0f0f0}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <header>
+            <h1>Puppet Enterprise &mdash; Preflight Report</h1>
+            <p>Architecture: ${$arch['architecture']} &bull; Platform: ${platform} &bull; Targets: ${all_targets.size}${version_meta}</p>
+            <p>Generated: ${report_ts}</p>
+          </header>
+          <div class="banner ${overall_cls}">${overall_msg}</div>
+          <table>
+            <thead><tr><th></th><th>Check</th><th>Result</th></tr></thead>
+            <tbody>
+      ${tr_html}
+            </tbody>
+          </table>
+          <footer>peadm::preflight &bull; ${report_ts}</footer>
+        </div>
+      </body>
+      </html>
+      | HTML
+    file::write($actual_report_file, $html_content)
+    out::message("# HTML report written to ${actual_report_file}")
+  }
 
   if $warning_count > 0 {
     return("Preflight checks completed with ${warning_count} warning(s). Review the summary above before proceeding.")
